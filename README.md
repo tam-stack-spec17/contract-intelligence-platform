@@ -15,7 +15,7 @@
 3. [The Big Picture: Pipeline Flowchart](#3-the-big-picture-pipeline-flowchart)
 4. [How a Contract Flows Through the System](#4-how-a-contract-flows-through-the-system)
 5. [What Is "Fine-Tuning," Really?](#5-what-is-fine-tuning-really)
-6. [For Advanced Readers: Technical Details](#6-for-advanced-readers-technical-details)
+6. [Technical Details](#6-technical-details)
 7. [Glossary](#7-glossary)
 8. [Results](#8-results)
 9. [How to Run This](#9-how-to-run-this)
