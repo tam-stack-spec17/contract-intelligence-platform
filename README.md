@@ -139,7 +139,7 @@ honestly measure how well it generalizes to clauses it's never seen.
 
 ---
 
-## 6. For Advanced Readers: Technical Details
+## 6. Technical Details
 
 ### Dataset
 - **CUAD v1** (Contract Understanding Atticus Dataset) — 510 commercial
