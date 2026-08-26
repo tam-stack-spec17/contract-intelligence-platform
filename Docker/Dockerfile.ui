@@ -1,0 +1,18 @@
+# Use an official lightweight Python image
+FROM python:3.10-slim
+
+# Set the working directory
+WORKDIR /app
+
+# Copy dependencies and install
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy the frontend UI code
+COPY ./src/ui /app/ui
+
+# Expose the Streamlit port
+EXPOSE 8501
+
+# Run the Streamlit dashboard
+CMD ["streamlit", "run", "ui/app.py", "--server.port=8501", "--server.address=0.0.0.0"]
