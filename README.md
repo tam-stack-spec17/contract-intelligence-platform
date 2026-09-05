@@ -150,7 +150,7 @@ honestly measure how well it generalizes to clauses it's never seen.
 - Significant class imbalance across categories — handled via stratified
   splitting and flagged explicitly during EDA (Step 2)
 
-### Model architecture
+###  Model architecture
 - **Base model:** `nlpaueb/legal-bert-base-uncased` — a BERT-family
   transformer pretrained on legal text specifically (contracts, court
   opinions, legislation), rather than generic web text
