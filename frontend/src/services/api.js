@@ -1,52 +1,82 @@
-const API_BASE_URL = "http://localhost:8000";
+const API_BASE_URL = "http://127.0.0.1:8000";
 
 /*
- * Upload a contract to the FastAPI backend.
+ * Upload a contract to the real FastAPI backend.
  *
- * The backend will eventually:
- * 1. Receive the PDF/DOCX
- * 2. Extract the text
- * 3. Run NLP/ML analysis
- * 4. Return entities, clauses and risk information
+ * Backend endpoint:
+ * POST /api/contracts/analyze
+ *
+ * The backend performs:
+ * - PDF/DOCX text extraction
+ * - OCR when required
+ * - contract validation
+ * - Legal-BERT clause classification
+ * - entity extraction
+ * - risk scoring
+ * - risk findings
  */
-
 export const uploadContract = async (file) => {
-  const formData = new FormData();
+  if (!file) {
+    throw new Error("No contract file selected.");
+  }
 
+  const formData = new FormData();
   formData.append("file", file);
 
-  const response = await fetch(
-    `${API_BASE_URL}/api/contracts/analyze`,
-    {
-      method: "POST",
-      body: formData,
-    }
-  );
+  let response;
 
-  if (!response.ok) {
+  try {
+    response = await fetch(
+      `${API_BASE_URL}/api/contracts/analyze`,
+      {
+        method: "POST",
+        body: formData,
+      }
+    );
+  } catch (error) {
     throw new Error(
-      `Contract analysis failed: ${response.status}`
+      "Unable to connect to the Contract Intelligence backend. Make sure FastAPI is running on port 8000."
     );
   }
 
-  return await response.json();
+  let data = null;
+
+  try {
+    data = await response.json();
+  } catch {
+    data = null;
+  }
+
+  if (!response.ok) {
+    let message = `Contract analysis failed (${response.status}).`;
+
+    if (data?.detail?.message) {
+      message = data.detail.message;
+    } else if (typeof data?.detail === "string") {
+      message = data.detail;
+    }
+
+    throw new Error(message);
+  }
+
+  return data;
 };
 
 
 /*
- * Health check.
- *
- * This allows the frontend to check whether
- * the FastAPI backend is running.
+ * Backend health check.
  */
-
 export const checkBackendHealth = async () => {
-  const response = await fetch(
-    `${API_BASE_URL}/health`
-  );
+  let response;
+
+  try {
+    response = await fetch(`${API_BASE_URL}/health`);
+  } catch {
+    throw new Error("Contract Intelligence backend is unavailable.");
+  }
 
   if (!response.ok) {
-    throw new Error("Backend is not available");
+    throw new Error("Contract Intelligence backend is unavailable.");
   }
 
   return await response.json();
