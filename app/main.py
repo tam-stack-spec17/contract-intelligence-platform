@@ -43,3 +43,7 @@ def health_check():
         "status": "healthy",
         "service": "AI Contract Intelligence API"
     }
+
+@app.get("/health")
+def health_check():
+    return {"status": "healthy"}
