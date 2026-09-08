@@ -1,7 +1,15 @@
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import io
 import re
+import json
+import shutil
+import hashlib
+import secrets
+import os
+import smtplib
+from email.message import EmailMessage
+from datetime import datetime, timedelta
 
 import fitz
 import torch
@@ -9,11 +17,34 @@ import pytesseract
 
 from PIL import Image
 from docx import Document
-from fastapi import FastAPI, File, UploadFile, HTTPException
+
+from fastapi import (
+    FastAPI,
+    File,
+    UploadFile,
+    HTTPException,
+    Depends,
+    Query,
+)
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, EmailStr
+from sqlalchemy.orm import Session
+
 from transformers import (
     AutoTokenizer,
     AutoModelForSequenceClassification,
+)
+
+from database import init_db, get_db
+from models import User, Contract, Analysis, EmailOTP
+from dotenv import load_dotenv
+
+from auth import (
+    hash_password,
+    verify_password,
+    create_access_token,
+    get_current_user,
+    generate_otp,
 )
 
 
@@ -22,6 +53,14 @@ from transformers import (
 # ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+load_dotenv(BASE_DIR / ".env")
+
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USERNAME = os.getenv("SMTP_USERNAME", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USERNAME)
 
 MODEL_PATH = (
     BASE_DIR
@@ -33,17 +72,27 @@ TESSERACT_PATH = (
     r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 )
 
+STORAGE_DIR = (
+    BASE_DIR
+    / "data"
+    / "contract_storage"
+)
+
+STORAGE_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
 pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
 
 MAX_FILE_SIZE = 50 * 1024 * 1024
-
 MAX_CLAUSE_SEGMENTS = 300
-
 CLASSIFICATION_BATCH_SIZE = 8
-
 MIN_CLAUSE_CONFIDENCE = 0.55
-
 MIN_CONTRACT_SIGNALS = 2
+
+OTP_EXPIRY_MINUTES = 10
+MAX_OTP_ATTEMPTS = 5
 
 
 # ============================================================
@@ -52,8 +101,11 @@ MIN_CONTRACT_SIGNALS = 2
 
 app = FastAPI(
     title="Contract Intelligence API",
-    description="AI-powered contract analysis using Legal-BERT",
-    version="2.3.0",
+    description=(
+        "AI-powered Contract Intelligence platform "
+        "using Legal-BERT"
+    ),
+    version="3.1.0",
 )
 
 
@@ -68,11 +120,26 @@ app.add_middleware(
         "http://127.0.0.1:5173",
         "http://localhost:5174",
         "http://127.0.0.1:5174",
+        "http://localhost:5175",
+        "http://127.0.0.1:5175",
+        "http://localhost:5176",
+        "http://127.0.0.1:5176",
+        "http://localhost:5177",
+        "http://127.0.0.1:5177",
+        "http://localhost:5178",
+        "http://127.0.0.1:5178",
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ============================================================
+# DATABASE
+# ============================================================
+
+init_db()
 
 
 # ============================================================
@@ -118,14 +185,125 @@ load_model()
 
 
 # ============================================================
-# TEXT CLEANING
+# AUTHENTICATION SCHEMAS
+# ============================================================
+
+class RegisterRequest(BaseModel):
+    name: str
+    email: EmailStr
+    password: str
+    company: Optional[str] = None
+
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class ProfileUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    company: Optional[str] = None
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+
+class VerifyOTPRequest(BaseModel):
+    email: EmailStr
+    otp: str
+
+
+class ResetPasswordRequest(BaseModel):
+    email: EmailStr
+    otp: str
+    new_password: str
+
+
+class ContractUpdateRequest(BaseModel):
+    status: Optional[str] = None
+    favorite: Optional[bool] = None
+    folder: Optional[str] = None
+
+
+# ============================================================
+# PASSWORD VALIDATION
+# ============================================================
+
+def validate_password(password: str):
+    if len(password) < 8:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Password must contain at least "
+                "8 characters."
+            ),
+        )
+
+
+# ============================================================
+# OTP HELPERS
+# ============================================================
+
+def hash_otp(otp: str) -> str:
+    return hashlib.sha256(
+        otp.encode("utf-8")
+    ).hexdigest()
+
+
+def invalidate_previous_reset_otps(
+    user_id: int,
+    db: Session,
+):
+    previous_otps = (
+        db.query(EmailOTP)
+        .filter(
+            EmailOTP.user_id == user_id,
+            EmailOTP.purpose == "password_reset",
+            EmailOTP.used == False,
+        )
+        .all()
+    )
+
+    for otp_record in previous_otps:
+        otp_record.used = True
+
+
+def get_latest_active_reset_otp(
+    user_id: int,
+    db: Session,
+):
+    return (
+        db.query(EmailOTP)
+        .filter(
+            EmailOTP.user_id == user_id,
+            EmailOTP.purpose == "password_reset",
+            EmailOTP.used == False,
+        )
+        .order_by(
+            EmailOTP.created_at.desc()
+        )
+        .first()
+    )
+
+
+# ============================================================
+# GENERAL HELPERS
 # ============================================================
 
 def clean_text(text: str) -> str:
     if not text:
         return ""
 
-    text = text.replace("\x00", " ")
+    text = text.replace(
+        "\x00",
+        " ",
+    )
 
     text = re.sub(
         r"[ \t]+",
@@ -142,6 +320,76 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
+def safe_filename(filename: str) -> str:
+    name = Path(
+        filename or "contract"
+    ).name
+
+    name = re.sub(
+        r"[^A-Za-z0-9._-]+",
+        "_",
+        name,
+    )
+
+    return name[:180] or "contract"
+
+
+def user_storage_directory(
+    user_id: int,
+) -> Path:
+
+    directory = (
+        STORAGE_DIR
+        / str(user_id)
+    )
+
+    directory.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    return directory
+
+
+def serialize_user(user: User):
+    return {
+        "id": user.id,
+        "name": user.name,
+        "email": user.email,
+        "company": user.company,
+        "email_verified": user.email_verified,
+        "created_at": (
+            user.created_at.isoformat()
+            if user.created_at
+            else None
+        ),
+    }
+
+
+def serialize_contract(
+    contract: Contract,
+):
+    return {
+        "id": contract.id,
+        "filename": contract.filename,
+        "folder": contract.folder,
+        "status": contract.status,
+        "favorite": contract.favorite,
+        "risk_score": contract.risk_score,
+        "risk_level": contract.risk_level,
+        "created_at": (
+            contract.created_at.isoformat()
+            if contract.created_at
+            else None
+        ),
+        "updated_at": (
+            contract.updated_at.isoformat()
+            if contract.updated_at
+            else None
+        ),
+    }
+
+
 # ============================================================
 # PDF EXTRACTION
 # ============================================================
@@ -149,10 +397,6 @@ def clean_text(text: str) -> str:
 def extract_pdf_text(
     file_bytes: bytes,
 ) -> tuple[str, bool]:
-
-    extracted_pages = []
-
-    ocr_used = False
 
     try:
         pdf = fitz.open(
@@ -165,26 +409,43 @@ def extract_pdf_text(
             detail=f"Unable to read PDF: {exc}",
         )
 
+    extracted_pages = []
+    ocr_used = False
+
     for page in pdf:
-        text = page.get_text("text")
+
+        text = page.get_text(
+            "text"
+        )
 
         if text and text.strip():
-            extracted_pages.append(text)
+
+            extracted_pages.append(
+                text
+            )
+
             continue
 
-        # OCR fallback for image/scanned pages
         try:
+
             pix = page.get_pixmap(
-                matrix=fitz.Matrix(2, 2),
+                matrix=fitz.Matrix(
+                    2,
+                    2,
+                ),
                 alpha=False,
             )
 
             image = Image.open(
-                io.BytesIO(pix.tobytes("png"))
+                io.BytesIO(
+                    pix.tobytes("png")
+                )
             )
 
-            ocr_text = pytesseract.image_to_string(
-                image
+            ocr_text = (
+                pytesseract.image_to_string(
+                    image
+                )
             )
 
             extracted_pages.append(
@@ -194,13 +455,19 @@ def extract_pdf_text(
             ocr_used = True
 
         except Exception:
+
             extracted_pages.append("")
 
     pdf.close()
 
-    text = "\n".join(extracted_pages)
+    text = "\n".join(
+        extracted_pages
+    )
 
-    return clean_text(text), ocr_used
+    return (
+        clean_text(text),
+        ocr_used,
+    )
 
 
 # ============================================================
@@ -212,10 +479,13 @@ def extract_docx_text(
 ) -> str:
 
     try:
+
         document = Document(
             io.BytesIO(file_bytes)
         )
+
     except Exception as exc:
+
         raise HTTPException(
             status_code=400,
             detail=f"Unable to read DOCX: {exc}",
@@ -224,8 +494,12 @@ def extract_docx_text(
     parts = []
 
     for paragraph in document.paragraphs:
+
         if paragraph.text.strip():
-            parts.append(paragraph.text)
+
+            parts.append(
+                paragraph.text
+            )
 
     for table in document.tables:
 
@@ -234,12 +508,15 @@ def extract_docx_text(
             cells = []
 
             for cell in row.cells:
+
                 if cell.text.strip():
+
                     cells.append(
                         cell.text.strip()
                     )
 
             if cells:
+
                 parts.append(
                     " | ".join(cells)
                 )
@@ -258,7 +535,9 @@ def extract_document(
     file_bytes: bytes,
 ) -> tuple[str, bool]:
 
-    suffix = Path(filename).suffix.lower()
+    suffix = Path(
+        filename
+    ).suffix.lower()
 
     if suffix == ".pdf":
 
@@ -269,13 +548,18 @@ def extract_document(
     if suffix == ".docx":
 
         return (
-            extract_docx_text(file_bytes),
+            extract_docx_text(
+                file_bytes
+            ),
             False,
         )
 
     raise HTTPException(
         status_code=400,
-        detail="Only PDF and DOCX files are supported.",
+        detail=(
+            "Only PDF and DOCX files "
+            "are supported."
+        ),
     )
 
 
@@ -335,9 +619,10 @@ def detect_contract(
 
     signals = []
 
-    for signal_name, patterns in (
-        CONTRACT_SIGNAL_PATTERNS.items()
-    ):
+    for (
+        signal_name,
+        patterns,
+    ) in CONTRACT_SIGNAL_PATTERNS.items():
 
         for pattern in patterns:
 
@@ -345,13 +630,17 @@ def detect_contract(
                 pattern,
                 lower_text,
             ):
+
                 signals.append(
                     signal_name
                 )
+
                 break
 
     signals = list(
-        dict.fromkeys(signals)
+        dict.fromkeys(
+            signals
+        )
     )
 
     confidence = min(
@@ -387,7 +676,6 @@ def segment_text(
     if not text:
         return []
 
-    # Prefer paragraph/section boundaries.
     chunks = re.split(
         r"\n\s*\n+",
         text,
@@ -397,12 +685,13 @@ def segment_text(
 
     for chunk in chunks:
 
-        chunk = clean_text(chunk)
+        chunk = clean_text(
+            chunk
+        )
 
         if len(chunk) < 80:
             continue
 
-        # Split very large sections.
         if len(chunk) > 3500:
 
             sentences = re.split(
@@ -421,6 +710,7 @@ def segment_text(
                 ):
 
                     if len(current) >= 80:
+
                         segments.append(
                             current.strip()
                         )
@@ -434,16 +724,23 @@ def segment_text(
                         + sentence
                     )
 
-            if len(current.strip()) >= 80:
+            if len(
+                current.strip()
+            ) >= 80:
+
                 segments.append(
                     current.strip()
                 )
 
         else:
 
-            segments.append(chunk)
+            segments.append(
+                chunk
+            )
 
-    return segments[:MAX_CLAUSE_SEGMENTS]
+    return segments[
+        :MAX_CLAUSE_SEGMENTS
+    ]
 
 
 # ============================================================
@@ -558,11 +855,14 @@ def get_label_name(
         0 <= class_id
         < len(DEFAULT_LABEL_NAMES)
     ):
+
         return DEFAULT_LABEL_NAMES[
             class_id
         ]
 
-    return f"Class {class_id}"
+    return (
+        f"Class {class_id}"
+    )
 
 
 # ============================================================
@@ -597,18 +897,25 @@ RISK_WEIGHTS = {
 
 def calculate_risk(
     clauses: List[Dict[str, Any]],
-) -> tuple[float, str, List[Dict[str, Any]]]:
+) -> tuple[
+    float,
+    str,
+    List[Dict[str, Any]],
+]:
 
     findings = []
-
     contributions = []
 
     for clause in clauses:
 
-        label = clause["label"]
+        label = clause[
+            "label"
+        ]
 
         confidence = float(
-            clause["confidence"]
+            clause[
+                "confidence"
+            ]
         )
 
         weight = RISK_WEIGHTS.get(
@@ -617,7 +924,8 @@ def calculate_risk(
         )
 
         contribution = (
-            confidence * weight
+            confidence
+            * weight
         )
 
         contributions.append(
@@ -663,9 +971,13 @@ def calculate_risk(
             )
 
     if not contributions:
-        return 0.0, "LOW", findings
 
-    # Normalize to a practical 0-100 application score.
+        return (
+            0.0,
+            "LOW",
+            findings,
+        )
+
     raw_score = (
         sum(contributions)
         / max(
@@ -689,14 +1001,18 @@ def calculate_risk(
         risk_level = "LOW"
 
     findings.sort(
-        key=lambda item: item[
+        key=lambda item:
+        item[
             "risk_contribution"
         ],
         reverse=True,
     )
 
     return (
-        round(risk_score, 1),
+        round(
+            risk_score,
+            1,
+        ),
         risk_level,
         findings,
     )
@@ -712,7 +1028,6 @@ def extract_entities(
 
     entities = []
 
-    # Dates
     date_patterns = [
         r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b",
         r"\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4}\b",
@@ -730,11 +1045,12 @@ def extract_entities(
             entities.append(
                 {
                     "type": "DATE",
-                    "text": match.group(0),
+                    "text": match.group(
+                        0
+                    ),
                 }
             )
 
-    # Monetary values
     money_pattern = (
         r"(?:US\$|\$|USD)\s?"
         r"\d[\d,]*(?:\.\d{1,2})?"
@@ -750,11 +1066,12 @@ def extract_entities(
         entities.append(
             {
                 "type": "MONEY",
-                "text": match.group(0),
+                "text": match.group(
+                    0
+                ),
             }
         )
 
-    # Jurisdiction
     jurisdiction_patterns = [
         r"laws of the\s+([A-Za-z .]+?)(?:\.|,|;|\n)",
         r"laws of\s+([A-Za-z .]+?)(?:\.|,|;|\n)",
@@ -769,7 +1086,11 @@ def extract_entities(
             re.IGNORECASE,
         ):
 
-            value = match.group(0).strip()
+            value = (
+                match.group(
+                    0
+                ).strip()
+            )
 
             if len(value) <= 150:
 
@@ -780,7 +1101,6 @@ def extract_entities(
                     }
                 )
 
-    # Common company/party declarations.
     party_patterns = [
         r"between\s+(.{3,100}?)\s+and\s+(.{3,100}?)(?:\s+this|\s+dated|\.)",
         r"([A-Z][A-Za-z0-9&,.\- ]{2,80}(?:Corp\.|Corporation|Company|LLC|Ltd\.|Inc\.))",
@@ -804,8 +1124,7 @@ def extract_entities(
                     value = (
                         match.group(
                             group_index
-                        )
-                        .strip()
+                        ).strip()
                     )
 
                     if (
@@ -824,8 +1143,9 @@ def extract_entities(
             else:
 
                 value = (
-                    match.group(1)
-                    .strip()
+                    match.group(
+                        1
+                    ).strip()
                 )
 
                 entities.append(
@@ -835,9 +1155,7 @@ def extract_entities(
                     }
                 )
 
-    # Remove duplicates.
     unique_entities = []
-
     seen = set()
 
     for entity in entities:
@@ -856,7 +1174,9 @@ def extract_entities(
             entity
         )
 
-    return unique_entities[:100]
+    return unique_entities[
+        :100
+    ]
 
 
 # ============================================================
@@ -873,11 +1193,16 @@ def classify_clauses(
     relevant_segments = [
         segment
         for segment in segments
-        if is_relevant_clause(segment)
+        if is_relevant_clause(
+            segment
+        )
     ]
 
     if not relevant_segments:
-        relevant_segments = segments[:20]
+
+        relevant_segments = (
+            segments[:20]
+        )
 
     results = []
 
@@ -907,17 +1232,25 @@ def classify_clauses(
                 **encoded
             )
 
-        probabilities = torch.softmax(
-            outputs.logits,
-            dim=-1,
+        probabilities = (
+            torch.softmax(
+                outputs.logits,
+                dim=-1,
+            )
         )
 
-        confidences, class_ids = torch.max(
-            probabilities,
-            dim=-1,
+        confidences, class_ids = (
+            torch.max(
+                probabilities,
+                dim=-1,
+            )
         )
 
-        for text, confidence, class_id in zip(
+        for (
+            text,
+            confidence,
+            class_id,
+        ) in zip(
             batch,
             confidences.tolist(),
             class_ids.tolist(),
@@ -943,7 +1276,9 @@ def classify_clauses(
                     "class_id": int(
                         class_id
                     ),
-                    "text": text[:3000],
+                    "text": text[
+                        :3000
+                    ],
                 }
             )
 
@@ -951,37 +1286,13 @@ def classify_clauses(
 
 
 # ============================================================
-# HEALTH
+# CORE ANALYSIS ENGINE
 # ============================================================
 
-@app.get("/health")
-def health():
-
-    return {
-        "status": "ok",
-        "service": "contract-intelligence-api",
-        "model_loaded": model is not None,
-        "model_classes": (
-            model.config.num_labels
-            if model is not None
-            else 0
-        ),
-        "ocr_available": Path(
-            TESSERACT_PATH
-        ).exists(),
-    }
-
-
-# ============================================================
-# CONTRACT ANALYSIS
-# ============================================================
-
-@app.post("/api/contracts/analyze")
-async def analyze_contract(
-    file: UploadFile = File(...),
+async def perform_contract_analysis(
+    filename: str,
+    file_bytes: bytes,
 ):
-
-    filename = file.filename or ""
 
     suffix = Path(
         filename
@@ -1000,13 +1311,14 @@ async def analyze_contract(
             ),
         )
 
-    file_bytes = await file.read()
-
     if not file_bytes:
 
         raise HTTPException(
             status_code=400,
-            detail="The uploaded file is empty.",
+            detail=(
+                "The uploaded file "
+                "is empty."
+            ),
         )
 
     if len(file_bytes) > MAX_FILE_SIZE:
@@ -1019,9 +1331,11 @@ async def analyze_contract(
             ),
         )
 
-    text, ocr_used = extract_document(
-        filename,
-        file_bytes,
+    text, ocr_used = (
+        extract_document(
+            filename,
+            file_bytes,
+        )
     )
 
     if len(text) < 50:
@@ -1031,15 +1345,18 @@ async def analyze_contract(
             detail={
                 "message": (
                     "Unable to extract enough "
-                    "text from the uploaded document."
+                    "text from the uploaded "
+                    "document."
                 ),
-                "document_type": "unreadable",
+                "document_type": (
+                    "unreadable"
+                ),
                 "ocr_used": ocr_used,
             },
         )
 
-    contract_detection = detect_contract(
-        text
+    contract_detection = (
+        detect_contract(text)
     )
 
     if not contract_detection[
@@ -1055,7 +1372,9 @@ async def analyze_contract(
                     "contractual language for "
                     "reliable analysis."
                 ),
-                "document_type": "non_contract",
+                "document_type": (
+                    "non_contract"
+                ),
                 "contract_confidence": (
                     contract_detection[
                         "confidence"
@@ -1081,11 +1400,14 @@ async def analyze_contract(
         text
     )
 
-    risk_score, risk_level, findings = (
-        calculate_risk(clauses)
+    (
+        risk_score,
+        risk_level,
+        findings,
+    ) = calculate_risk(
+        clauses
     )
 
-    # Convert clauses to frontend-friendly objects.
     frontend_clauses = []
 
     for clause in clauses:
@@ -1111,14 +1433,18 @@ async def analyze_contract(
 
         frontend_clauses.append(
             {
-                "name": clause["label"],
+                "name": clause[
+                    "label"
+                ],
                 "confidence": clause[
                     "confidence"
                 ],
                 "class_id": clause[
                     "class_id"
                 ],
-                "text": clause["text"],
+                "text": clause[
+                    "text"
+                ],
                 "status": status,
                 "description": (
                     "Clause detected by the "
@@ -1127,19 +1453,13 @@ async def analyze_contract(
             }
         )
 
-    return {
+    result = {
         "contract_name": filename,
-
         "risk_score": risk_score,
-
         "risk_level": risk_level,
-
         "entities": entities,
-
         "clauses": frontend_clauses,
-
         "findings": findings,
-
         "metadata": {
             "file_type": suffix,
             "file_size_bytes": len(
@@ -1167,11 +1487,1363 @@ async def analyze_contract(
                 MIN_CLAUSE_CONFIDENCE
             ),
         },
-
         "disclaimer": (
             "Risk scores are application-level "
             "policy indicators generated from "
             "model predictions and configured "
             "risk weights. They are not legal advice."
         ),
+    }
+
+    return result
+
+
+# ============================================================
+# AUTHENTICATION
+# ============================================================
+
+@app.post(
+    "/api/auth/register"
+)
+def register_user(
+    request: RegisterRequest,
+    db: Session = Depends(
+        get_db
+    ),
+):
+
+    email = (
+        request.email
+        .lower()
+        .strip()
+    )
+
+    existing_user = (
+        db.query(User)
+        .filter(
+            User.email == email
+        )
+        .first()
+    )
+
+    if existing_user:
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "An account with this "
+                "email already exists."
+            ),
+        )
+
+    if not request.name.strip():
+
+        raise HTTPException(
+            status_code=400,
+            detail="Name is required.",
+        )
+
+    validate_password(
+        request.password
+    )
+
+    user = User(
+        name=request.name.strip(),
+        email=email,
+        company=(
+            request.company.strip()
+            if request.company
+            else None
+        ),
+        password_hash=hash_password(
+            request.password
+        ),
+        email_verified=False,
+    )
+
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    token = create_access_token(
+        user.id
+    )
+
+    return {
+        "message": (
+            "Account created successfully."
+        ),
+        "access_token": token,
+        "token_type": "bearer",
+        "user": serialize_user(
+            user
+        ),
+    }
+
+
+@app.post(
+    "/api/auth/login"
+)
+def login_user(
+    request: LoginRequest,
+    db: Session = Depends(
+        get_db
+    ),
+):
+
+    email = (
+        request.email
+        .lower()
+        .strip()
+    )
+
+    user = (
+        db.query(User)
+        .filter(
+            User.email == email
+        )
+        .first()
+    )
+
+    if not user:
+
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                "Invalid email or password."
+            ),
+        )
+
+    if not verify_password(
+        request.password,
+        user.password_hash,
+    ):
+
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                "Invalid email or password."
+            ),
+        )
+
+    token = create_access_token(
+        user.id
+    )
+
+    return {
+        "message": "Login successful.",
+        "access_token": token,
+        "token_type": "bearer",
+        "user": serialize_user(
+            user
+        ),
+    }
+
+
+@app.get(
+    "/api/auth/me"
+)
+def get_my_profile(
+    current_user: User = Depends(
+        get_current_user
+    ),
+):
+
+    return serialize_user(
+        current_user
+    )
+
+
+@app.put(
+    "/api/auth/profile"
+)
+def update_profile(
+    request: ProfileUpdateRequest,
+    current_user: User = Depends(
+        get_current_user
+    ),
+    db: Session = Depends(
+        get_db
+    ),
+):
+
+    if request.name is not None:
+
+        if not request.name.strip():
+
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Name cannot be empty."
+                ),
+            )
+
+        current_user.name = (
+            request.name.strip()
+        )
+
+    if request.company is not None:
+
+        current_user.company = (
+            request.company.strip()
+        )
+
+    db.commit()
+    db.refresh(
+        current_user
+    )
+
+    return {
+        "message": (
+            "Profile updated successfully."
+        ),
+        "user": serialize_user(
+            current_user
+        ),
+    }
+
+
+@app.put(
+    "/api/auth/change-password"
+)
+def change_password(
+    request: ChangePasswordRequest,
+    current_user: User = Depends(
+        get_current_user
+    ),
+    db: Session = Depends(
+        get_db
+    ),
+):
+
+    if not verify_password(
+        request.current_password,
+        current_user.password_hash,
+    ):
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Current password is incorrect."
+            ),
+        )
+
+    validate_password(
+        request.new_password
+    )
+
+    current_user.password_hash = (
+        hash_password(
+            request.new_password
+        )
+    )
+
+    db.commit()
+
+    return {
+        "message": (
+            "Password changed successfully."
+        )
+    }
+
+
+# ============================================================
+# FORGOT PASSWORD / OTP
+# ============================================================
+
+@app.post(
+    "/api/auth/forgot-password"
+)
+def forgot_password(
+    request: ForgotPasswordRequest,
+    db: Session = Depends(
+        get_db
+    ),
+):
+
+    email = (
+        request.email
+        .lower()
+        .strip()
+    )
+
+    user = (
+        db.query(User)
+        .filter(
+            User.email == email
+        )
+        .first()
+    )
+
+    # Security-friendly response:
+    # do not reveal whether an account exists.
+    generic_message = (
+        "If an account exists for this email, "
+        "a verification code has been generated."
+    )
+
+    if not user:
+
+        return {
+            "message": generic_message,
+        }
+
+    # Invalidate previous active OTPs.
+    invalidate_previous_reset_otps(
+        user.id,
+        db,
+    )
+
+    otp = generate_otp()
+
+    otp_record = EmailOTP(
+        user_id=user.id,
+        purpose="password_reset",
+        otp_hash=hash_otp(otp),
+        expires_at=(
+            datetime.utcnow()
+            + timedelta(
+                minutes=OTP_EXPIRY_MINUTES
+            )
+        ),
+        attempts=0,
+        used=False,
+    )
+
+    db.add(otp_record)
+    db.commit()
+
+    # ========================================================
+    # REAL EMAIL DELIVERY
+    # ========================================================
+    if not SMTP_USERNAME or not SMTP_PASSWORD or not SMTP_FROM:
+        # Keep the API safe: never expose the OTP in the response.
+        # Configure SMTP credentials in the project .env file.
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Email service is not configured. "
+                "Add SMTP_USERNAME, SMTP_PASSWORD and SMTP_FROM to .env."
+            ),
+        )
+
+    message = EmailMessage()
+    message["Subject"] = "ContractIQ Password Reset Code"
+    message["From"] = SMTP_FROM
+    message["To"] = user.email
+    message.set_content(
+        f"Hello {user.name or 'there'},\n\n"
+        f"Your ContractIQ password reset verification code is: {otp}\n\n"
+        f"This code expires in {OTP_EXPIRY_MINUTES} minutes.\n\n"
+        "If you did not request a password reset, you can safely ignore this email.\n\n"
+        "ContractIQ"
+    )
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+            server.starttls()
+            server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            server.send_message(message)
+    except Exception as exc:
+        # Do not leave an unusable OTP active if delivery failed.
+        otp_record.used = True
+        db.commit()
+        print(f"[EMAIL] Password reset email failed: {exc}")
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Unable to send the verification email right now. "
+                "Please check the SMTP configuration."
+            ),
+        )
+
+    print(f"[EMAIL] Password reset OTP sent to {user.email}")
+
+    return {
+        "message": (
+            "If an account exists for this email, "
+            "a verification code has been sent."
+        ),
+    }
+
+
+@app.post(
+    "/api/auth/verify-otp"
+)
+def verify_otp(
+    request: VerifyOTPRequest,
+    db: Session = Depends(
+        get_db
+    ),
+):
+
+    email = (
+        request.email
+        .lower()
+        .strip()
+    )
+
+    user = (
+        db.query(User)
+        .filter(
+            User.email == email
+        )
+        .first()
+    )
+
+    if not user:
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Invalid verification code."
+            ),
+        )
+
+    otp_record = (
+        get_latest_active_reset_otp(
+            user.id,
+            db,
+        )
+    )
+
+    if not otp_record:
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "No active verification code. "
+                "Please request a new code."
+            ),
+        )
+
+    if (
+        datetime.utcnow()
+        > otp_record.expires_at
+    ):
+
+        otp_record.used = True
+        db.commit()
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "This verification code has "
+                "expired. Please request a new one."
+            ),
+        )
+
+    if (
+        otp_record.attempts
+        >= MAX_OTP_ATTEMPTS
+    ):
+
+        otp_record.used = True
+        db.commit()
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Too many incorrect attempts. "
+                "Please request a new code."
+            ),
+        )
+
+    submitted_hash = hash_otp(
+        request.otp.strip()
+    )
+
+    if not secrets.compare_digest(
+        submitted_hash,
+        otp_record.otp_hash,
+    ):
+
+        otp_record.attempts += 1
+        db.commit()
+
+        remaining = (
+            MAX_OTP_ATTEMPTS
+            - otp_record.attempts
+        )
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Invalid verification code. "
+                f"{remaining} attempt(s) remaining."
+            ),
+        )
+
+    return {
+        "message": (
+            "Verification code accepted."
+        ),
+        "verified": True,
+    }
+
+
+@app.post(
+    "/api/auth/reset-password"
+)
+def reset_password(
+    request: ResetPasswordRequest,
+    db: Session = Depends(
+        get_db
+    ),
+):
+
+    email = (
+        request.email
+        .lower()
+        .strip()
+    )
+
+    user = (
+        db.query(User)
+        .filter(
+            User.email == email
+        )
+        .first()
+    )
+
+    if not user:
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Unable to reset password."
+            ),
+        )
+
+    validate_password(
+        request.new_password
+    )
+
+    otp_record = (
+        get_latest_active_reset_otp(
+            user.id,
+            db,
+        )
+    )
+
+    if not otp_record:
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "No active verification code. "
+                "Please request a new one."
+            ),
+        )
+
+    if (
+        datetime.utcnow()
+        > otp_record.expires_at
+    ):
+
+        otp_record.used = True
+        db.commit()
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "This verification code has "
+                "expired. Please request a new one."
+            ),
+        )
+
+    if (
+        otp_record.attempts
+        >= MAX_OTP_ATTEMPTS
+    ):
+
+        otp_record.used = True
+        db.commit()
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Too many incorrect attempts. "
+                "Please request a new code."
+            ),
+        )
+
+    submitted_hash = hash_otp(
+        request.otp.strip()
+    )
+
+    if not secrets.compare_digest(
+        submitted_hash,
+        otp_record.otp_hash,
+    ):
+
+        otp_record.attempts += 1
+        db.commit()
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Invalid verification code."
+            ),
+        )
+
+    user.password_hash = hash_password(
+        request.new_password
+    )
+
+    otp_record.used = True
+
+    db.commit()
+
+    return {
+        "message": (
+            "Password reset successfully. "
+            "You can now sign in with your "
+            "new password."
+        )
+    }
+
+
+# ============================================================
+# CONTRACT ANALYSIS
+# ============================================================
+
+@app.post(
+    "/api/contracts/analyze"
+)
+async def analyze_contract(
+    file: UploadFile = File(...),
+):
+
+    filename = (
+        file.filename
+        or ""
+    )
+
+    file_bytes = await file.read()
+
+    return await perform_contract_analysis(
+        filename,
+        file_bytes,
+    )
+
+
+# ============================================================
+# SAVED CONTRACT ANALYSIS
+# ============================================================
+
+@app.post(
+    "/api/contracts/analyze-and-save"
+)
+async def analyze_and_save_contract(
+    file: UploadFile = File(...),
+    current_user: User = Depends(
+        get_current_user
+    ),
+    db: Session = Depends(
+        get_db
+    ),
+):
+
+    filename = (
+        file.filename
+        or "contract"
+    )
+
+    file_bytes = await file.read()
+
+    result = await perform_contract_analysis(
+        filename,
+        file_bytes,
+    )
+
+    user_dir = user_storage_directory(
+        current_user.id
+    )
+
+    contract = Contract(
+        user_id=current_user.id,
+        filename=filename,
+        folder="General",
+        status="Pending Review",
+        favorite=False,
+        risk_score=int(
+            round(
+                result[
+                    "risk_score"
+                ]
+            )
+        ),
+        risk_level=result[
+            "risk_level"
+        ],
+    )
+
+    db.add(contract)
+    db.commit()
+    db.refresh(contract)
+
+    stored_filename = (
+        f"{contract.id}_"
+        f"{safe_filename(filename)}"
+    )
+
+    stored_path = (
+        user_dir
+        / stored_filename
+    )
+
+    with open(
+        stored_path,
+        "wb",
+    ) as output_file:
+
+        output_file.write(
+            file_bytes
+        )
+
+    contract.stored_path = str(
+        stored_path
+    )
+
+    analysis = Analysis(
+        contract_id=contract.id,
+        result_json=json.dumps(
+            result,
+            ensure_ascii=False,
+        ),
+    )
+
+    db.add(analysis)
+
+    db.commit()
+
+    result["contract_id"] = (
+        contract.id
+    )
+
+    result["saved"] = True
+
+    return result
+
+
+# ============================================================
+# MULTI-FILE UPLOAD
+# ============================================================
+
+@app.post(
+    "/api/contracts/analyze-many"
+)
+async def analyze_many_contracts(
+    files: List[UploadFile] = File(...),
+    current_user: User = Depends(
+        get_current_user
+    ),
+    db: Session = Depends(
+        get_db
+    ),
+):
+
+    if not files:
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "No contract files "
+                "were uploaded."
+            ),
+        )
+
+    results = []
+
+    for file in files:
+
+        try:
+
+            filename = (
+                file.filename
+                or "contract"
+            )
+
+            file_bytes = (
+                await file.read()
+            )
+
+            result = (
+                await perform_contract_analysis(
+                    filename,
+                    file_bytes,
+                )
+            )
+
+            user_dir = (
+                user_storage_directory(
+                    current_user.id
+                )
+            )
+
+            contract = Contract(
+                user_id=current_user.id,
+                filename=filename,
+                folder="General",
+                status="Pending Review",
+                favorite=False,
+                risk_score=int(
+                    round(
+                        result[
+                            "risk_score"
+                        ]
+                    )
+                ),
+                risk_level=result[
+                    "risk_level"
+                ],
+            )
+
+            db.add(contract)
+            db.commit()
+            db.refresh(contract)
+
+            stored_filename = (
+                f"{contract.id}_"
+                f"{safe_filename(filename)}"
+            )
+
+            stored_path = (
+                user_dir
+                / stored_filename
+            )
+
+            with open(
+                stored_path,
+                "wb",
+            ) as output_file:
+
+                output_file.write(
+                    file_bytes
+                )
+
+            contract.stored_path = (
+                str(stored_path)
+            )
+
+            analysis = Analysis(
+                contract_id=contract.id,
+                result_json=json.dumps(
+                    result,
+                    ensure_ascii=False,
+                ),
+            )
+
+            db.add(analysis)
+            db.commit()
+
+            result[
+                "contract_id"
+            ] = contract.id
+
+            result[
+                "saved"
+            ] = True
+
+            results.append(
+                {
+                    "success": True,
+                    "result": result,
+                }
+            )
+
+        except HTTPException as exc:
+
+            results.append(
+                {
+                    "success": False,
+                    "filename": (
+                        file.filename
+                    ),
+                    "error": str(
+                        exc.detail
+                    ),
+                }
+            )
+
+        except Exception as exc:
+
+            results.append(
+                {
+                    "success": False,
+                    "filename": (
+                        file.filename
+                    ),
+                    "error": str(
+                        exc
+                    ),
+                }
+            )
+
+    return {
+        "total": len(files),
+        "successful": sum(
+            1
+            for item in results
+            if item["success"]
+        ),
+        "failed": sum(
+            1
+            for item in results
+            if not item["success"]
+        ),
+        "results": results,
+    }
+
+
+# ============================================================
+# CONTRACT LIBRARY
+# ============================================================
+
+@app.get(
+    "/api/contracts"
+)
+def list_contracts(
+    search: Optional[str] = Query(
+        default=None
+    ),
+    favorite: Optional[bool] = Query(
+        default=None
+    ),
+    status: Optional[str] = Query(
+        default=None
+    ),
+    folder: Optional[str] = Query(
+        default=None
+    ),
+    current_user: User = Depends(
+        get_current_user
+    ),
+    db: Session = Depends(
+        get_db
+    ),
+):
+
+    query = (
+        db.query(Contract)
+        .filter(
+            Contract.user_id
+            == current_user.id
+        )
+    )
+
+    if search:
+
+        search_value = (
+            f"%{search.strip()}%"
+        )
+
+        query = query.filter(
+            Contract.filename.ilike(
+                search_value
+            )
+        )
+
+    if favorite is not None:
+
+        query = query.filter(
+            Contract.favorite
+            == favorite
+        )
+
+    if status:
+
+        query = query.filter(
+            Contract.status
+            == status
+        )
+
+    if folder:
+
+        query = query.filter(
+            Contract.folder
+            == folder
+        )
+
+    contracts = (
+        query
+        .order_by(
+            Contract.updated_at.desc()
+        )
+        .all()
+    )
+
+    return {
+        "count": len(contracts),
+        "contracts": [
+            serialize_contract(
+                contract
+            )
+            for contract in contracts
+        ],
+    }
+
+
+# ============================================================
+# SINGLE CONTRACT
+# ============================================================
+
+@app.get(
+    "/api/contracts/{contract_id}"
+)
+def get_contract(
+    contract_id: int,
+    current_user: User = Depends(
+        get_current_user
+    ),
+    db: Session = Depends(
+        get_db
+    ),
+):
+
+    contract = (
+        db.query(Contract)
+        .filter(
+            Contract.id
+            == contract_id,
+            Contract.user_id
+            == current_user.id,
+        )
+        .first()
+    )
+
+    if not contract:
+
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "Contract not found."
+            ),
+        )
+
+    analysis = (
+        db.query(Analysis)
+        .filter(
+            Analysis.contract_id
+            == contract.id
+        )
+        .order_by(
+            Analysis.created_at.desc()
+        )
+        .first()
+    )
+
+    result = None
+
+    if analysis:
+
+        try:
+
+            result = json.loads(
+                analysis.result_json
+            )
+
+        except json.JSONDecodeError:
+
+            result = None
+
+    return {
+        "contract": (
+            serialize_contract(
+                contract
+            )
+        ),
+        "analysis": result,
+    }
+
+
+# ============================================================
+# UPDATE CONTRACT
+# ============================================================
+
+@app.patch(
+    "/api/contracts/{contract_id}"
+)
+def update_contract(
+    contract_id: int,
+    request: ContractUpdateRequest,
+    current_user: User = Depends(
+        get_current_user
+    ),
+    db: Session = Depends(
+        get_db
+    ),
+):
+
+    contract = (
+        db.query(Contract)
+        .filter(
+            Contract.id
+            == contract_id,
+            Contract.user_id
+            == current_user.id,
+        )
+        .first()
+    )
+
+    if not contract:
+
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "Contract not found."
+            ),
+        )
+
+    allowed_statuses = {
+        "Pending Review",
+        "Under Review",
+        "Reviewed",
+        "Approved",
+        "Rejected",
+    }
+
+    if request.status is not None:
+
+        if (
+            request.status
+            not in allowed_statuses
+        ):
+
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Invalid contract status."
+                ),
+            )
+
+        contract.status = (
+            request.status
+        )
+
+    if request.favorite is not None:
+
+        contract.favorite = (
+            request.favorite
+        )
+
+    if request.folder is not None:
+
+        folder = (
+            request.folder
+            .strip()
+        )
+
+        contract.folder = (
+            folder
+            if folder
+            else "General"
+        )
+
+    db.commit()
+    db.refresh(contract)
+
+    return {
+        "message": (
+            "Contract updated successfully."
+        ),
+        "contract": (
+            serialize_contract(
+                contract
+            )
+        ),
+    }
+
+
+# ============================================================
+# DELETE CONTRACT
+# ============================================================
+
+@app.delete(
+    "/api/contracts/{contract_id}"
+)
+def delete_contract(
+    contract_id: int,
+    current_user: User = Depends(
+        get_current_user
+    ),
+    db: Session = Depends(
+        get_db
+    ),
+):
+
+    contract = (
+        db.query(Contract)
+        .filter(
+            Contract.id
+            == contract_id,
+            Contract.user_id
+            == current_user.id,
+        )
+        .first()
+    )
+
+    if not contract:
+
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "Contract not found."
+            ),
+        )
+
+    if contract.stored_path:
+
+        stored_path = Path(
+            contract.stored_path
+        )
+
+        if stored_path.exists():
+
+            try:
+                stored_path.unlink()
+
+            except Exception:
+                pass
+
+    db.query(Analysis).filter(
+        Analysis.contract_id
+        == contract.id
+    ).delete(
+        synchronize_session=False
+    )
+
+    db.delete(contract)
+
+    db.commit()
+
+    return {
+        "message": (
+            "Contract deleted successfully."
+        )
+    }
+
+
+# ============================================================
+# DASHBOARD STATISTICS
+# ============================================================
+
+@app.get(
+    "/api/dashboard"
+)
+def dashboard(
+    current_user: User = Depends(
+        get_current_user
+    ),
+    db: Session = Depends(
+        get_db
+    ),
+):
+
+    contracts = (
+        db.query(Contract)
+        .filter(
+            Contract.user_id
+            == current_user.id
+        )
+        .all()
+    )
+
+    total = len(contracts)
+
+    high = sum(
+        1
+        for contract in contracts
+        if contract.risk_level
+        and contract.risk_level.upper()
+        == "HIGH"
+    )
+
+    medium = sum(
+        1
+        for contract in contracts
+        if contract.risk_level
+        and contract.risk_level.upper()
+        == "MEDIUM"
+    )
+
+    low = sum(
+        1
+        for contract in contracts
+        if contract.risk_level
+        and contract.risk_level.upper()
+        == "LOW"
+    )
+
+    scored = [
+        float(contract.risk_score)
+        for contract in contracts
+        if contract.risk_score
+        is not None
+    ]
+
+    average_risk = (
+        round(
+            sum(scored)
+            / len(scored),
+            1,
+        )
+        if scored
+        else 0
+    )
+
+    recent = sorted(
+        contracts,
+        key=lambda contract:
+        contract.updated_at
+        or datetime.min,
+        reverse=True,
+    )[:5]
+
+    return {
+        "total_contracts": total,
+        "high_risk": high,
+        "medium_risk": medium,
+        "low_risk": low,
+        "average_risk": average_risk,
+        "recent_contracts": [
+            serialize_contract(
+                contract
+            )
+            for contract in recent
+        ],
+    }
+
+
+# ============================================================
+# HEALTH
+# ============================================================
+
+@app.get(
+    "/health"
+)
+def health():
+
+    return {
+        "status": "ok",
+        "service": (
+            "contract-intelligence-api"
+        ),
+        "model_loaded": (
+            model is not None
+        ),
+        "model_classes": (
+            model.config.num_labels
+            if model is not None
+            else 0
+        ),
+        "ocr_available": Path(
+            TESSERACT_PATH
+        ).exists(),
+        "database": "connected",
+        "version": "3.1.0",
+        "authentication": True,
+        "password_reset": True,
+        "otp_mode": "development",
     }

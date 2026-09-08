@@ -1,37 +1,41 @@
 # Python
 __pycache__/
 *.py[cod]
-*.pyo
-*.pyd
-.pytest_cache/
-.mypy_cache/
 .venv/
 venv/
 env/
 
-# Environment / secrets
-.env
-
 # Node
 node_modules/
-frontend/dist/
-frontend/.vite/
+dist/
 
-# Build / logs
-*.log
+# Environment / secrets
+.env
+.env.*
+!.env.example
 
-# Local datasets
-data/cuad/
+# Local database / data
+*.db
+*.sqlite
+*.sqlite3
+data/*.db
+data/*.sqlite
+data/*.sqlite3
 
-# Local generated test files
-data/cuad/test_contract.pdf
-
-# Model checkpoints / large model files
-models/
-
-# OS files
+# OS / IDE
 .DS_Store
 Thumbs.db
+.vscode/
+.idea/
 
-# Jupyter
-.ipynb_checkpoints/
+# Temporary files
+*.log
+*.tmp
+main_backup.txt
+
+# Local model artifacts / archives
+*.zip
+*.pt
+*.pth
+*.bin
+*.safetensors
