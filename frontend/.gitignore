@@ -26,3 +26,4 @@ dist-ssr
 data/
 CUAD/
 *.zip
+.vercel
