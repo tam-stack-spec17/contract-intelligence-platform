@@ -1,19 +1,12 @@
-"""
-Step 5: Fine-tune a transformer for legal clause classification.
-Week 2, Day 1-4.
-
-Swap MODEL_NAME to compare backbones — worth reporting more than one:
-  - "nlpaueb/legal-bert-base-uncased"  pretrained on legal text (default, usually strongest)
-  - "law-ai/InLegalBERT"               alternative legal-domain model
-  - "roberta-base"                     general-purpose comparison point
-"""
-
 import json
+import os
 
 import numpy as np
 import pandas as pd
-import evaluate
+
 from datasets import Dataset
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+
 from transformers import (
     AutoModelForSequenceClassification,
     AutoTokenizer,
@@ -22,100 +15,629 @@ from transformers import (
     TrainingArguments,
 )
 
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
 MODEL_NAME = "nlpaueb/legal-bert-base-uncased"
+
 DATA_DIR = "data/processed"
 OUT_DIR = "models/clause_classifier"
-TEXT_COL = "clause"  # confirmed CUAD classification dataset column
 
-# --- Deadline mode -----------------------------------------------------
-# Set QUICK_MODE = True to get a fast end-to-end run (subsampled data,
-# fewer epochs) so you can confirm the whole pipeline works before
-# committing to a full run. Flip back to False once you've verified it
-# and have time for the real training run — the quick-mode numbers are
-# not what you want to report.
-QUICK_MODE = False
+TEXT_COL = "clause"
+LABEL_COL = "label"
+
+# ------------------------------------------------------------
+# QUICK MODE
+# ------------------------------------------------------------
+# True  = small smoke test
+# False = full training
+#
+# Since your machine is CPU-only, leave this TRUE locally.
+# For the final model, run full training on Colab GPU.
+# ------------------------------------------------------------
+
+QUICK_MODE = True
+
 QUICK_TRAIN_ROWS = 2000
 QUICK_VAL_ROWS = 400
 QUICK_EPOCHS = 1
+
 FULL_EPOCHS = 4
-# -------------------------------------------------------------------------
 
 
-def load_split(name, text_col, max_rows=None):
-    df = pd.read_csv(f"{DATA_DIR}/{name}.csv")
-    if max_rows:
-        df = df.sample(n=min(max_rows, len(df)), random_state=42)
-    return Dataset.from_pandas(
-        df[[text_col, "label_id"]].rename(columns={text_col: "text", "label_id": "labels"})
+# ============================================================
+# LOAD LABEL MAPPING
+# ============================================================
+
+def load_label_mapping():
+    label_path = os.path.join(
+        DATA_DIR,
+        "label_map.json"
     )
 
+    with open(
+        label_path,
+        "r",
+        encoding="utf-8"
+    ) as f:
+        label_data = json.load(f)
 
-def main():
-    with open(f"{DATA_DIR}/label_map.json") as f:
-        label_map = json.load(f)
-    id2label = {int(k): v for k, v in label_map["id2label"].items()}
-    label2id = label_map["label2id"]
-    num_labels = len(id2label)
+    label2id = label_data["label2id"]
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    # JSON converts dictionary keys to strings.
+    # Transformers expects integer IDs.
+    id2label = {
+        int(k): v
+        for k, v in label_data["id2label"].items()
+    }
 
-    def tokenize(batch):
-        return tokenizer(batch["text"], truncation=True, max_length=512)
+    num_labels = len(label2id)
+
+    # --------------------------------------------------------
+    # Validate mapping
+    # --------------------------------------------------------
+
+    expected_ids = set(range(num_labels))
+    actual_ids = set(id2label.keys())
+
+    if actual_ids != expected_ids:
+        raise ValueError(
+            "Invalid label mapping.\n"
+            f"Expected IDs: {sorted(expected_ids)}\n"
+            f"Actual IDs: {sorted(actual_ids)}"
+        )
+
+    if len(id2label) != len(label2id):
+        raise ValueError(
+            "label2id and id2label contain different numbers "
+            "of labels."
+        )
+
+    print("=" * 60)
+    print("LABEL MAPPING")
+    print("=" * 60)
+    print(f"Number of labels: {num_labels}")
+
+    for idx in range(min(10, num_labels)):
+        print(f"{idx}: {id2label[idx]}")
+
+    if num_labels > 10:
+        print("...")
+
+    print("=" * 60)
+
+    return label2id, id2label, num_labels
+
+
+# ============================================================
+# LOAD DATA
+# ============================================================
+
+def load_data():
+    train_path = os.path.join(
+        DATA_DIR,
+        "train.csv"
+    )
+
+    val_path = os.path.join(
+        DATA_DIR,
+        "val.csv"
+    )
+
+    train_df = pd.read_csv(train_path)
+    val_df = pd.read_csv(val_path)
+
+    # --------------------------------------------------------
+    # Validate required columns
+    # --------------------------------------------------------
+
+    required_columns = {
+        TEXT_COL,
+        LABEL_COL,
+        "label_id",
+    }
+
+    for column in required_columns:
+        if column not in train_df.columns:
+            raise ValueError(
+                f"Missing required column '{column}' "
+                f"in training data."
+            )
+
+        if column not in val_df.columns:
+            raise ValueError(
+                f"Missing required column '{column}' "
+                f"in validation data."
+            )
+
+    # --------------------------------------------------------
+    # Clean text
+    # --------------------------------------------------------
+
+    train_df[TEXT_COL] = (
+        train_df[TEXT_COL]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+
+    val_df[TEXT_COL] = (
+        val_df[TEXT_COL]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+
+    train_df = train_df[
+        train_df[TEXT_COL] != ""
+    ].copy()
+
+    val_df = val_df[
+        val_df[TEXT_COL] != ""
+    ].copy()
+
+    # --------------------------------------------------------
+    # Make sure labels are integers
+    # --------------------------------------------------------
+
+    train_df["label_id"] = train_df["label_id"].astype(int)
+    val_df["label_id"] = val_df["label_id"].astype(int)
+
+    # --------------------------------------------------------
+    # Quick mode
+    # --------------------------------------------------------
 
     if QUICK_MODE:
-        print(f"QUICK_MODE on: {QUICK_TRAIN_ROWS} train / {QUICK_VAL_ROWS} val rows, "
-              f"{QUICK_EPOCHS} epoch. For smoke-testing the pipeline only.")
-        train_ds = load_split("train", TEXT_COL, max_rows=QUICK_TRAIN_ROWS).map(tokenize, batched=True)
-        val_ds = load_split("val", TEXT_COL, max_rows=QUICK_VAL_ROWS).map(tokenize, batched=True)
+
+        train_df = train_df.head(
+            QUICK_TRAIN_ROWS
+        ).copy()
+
+        val_df = val_df.head(
+            QUICK_VAL_ROWS
+        ).copy()
+
+        print(
+            f"QUICK_MODE ON: "
+            f"{len(train_df)} train / "
+            f"{len(val_df)} val rows, "
+            f"{QUICK_EPOCHS} epoch."
+        )
+
     else:
-        train_ds = load_split("train", TEXT_COL).map(tokenize, batched=True)
-        val_ds = load_split("val", TEXT_COL).map(tokenize, batched=True)
 
-    model = AutoModelForSequenceClassification.from_pretrained(
-        MODEL_NAME, num_labels=num_labels, id2label=id2label, label2id=label2id
+        print(
+            f"FULL_MODE ON: "
+            f"{len(train_df)} train / "
+            f"{len(val_df)} val rows, "
+            f"{FULL_EPOCHS} epochs."
+        )
+
+    # --------------------------------------------------------
+    # Keep only the columns needed by Hugging Face Dataset
+    # --------------------------------------------------------
+
+    train_df = train_df[
+        [TEXT_COL, "label_id"]
+    ]
+
+    val_df = val_df[
+        [TEXT_COL, "label_id"]
+    ]
+
+    return train_df, val_df
+
+
+# ============================================================
+# TOKENIZATION
+# ============================================================
+
+def tokenize_datasets(train_df, val_df):
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        MODEL_NAME
     )
 
-    f1_metric = evaluate.load("f1")
-    precision_metric = evaluate.load("precision")
-    recall_metric = evaluate.load("recall")
+    train_dataset = Dataset.from_pandas(
+        train_df,
+        preserve_index=False
+    )
 
-    def compute_metrics(eval_pred):
-        logits, labels = eval_pred
-        preds = np.argmax(logits, axis=-1)
-        return {
-            "f1_weighted": f1_metric.compute(predictions=preds, references=labels, average="weighted")["f1"],
-            "precision_weighted": precision_metric.compute(predictions=preds, references=labels, average="weighted")["precision"],
-            "recall_weighted": recall_metric.compute(predictions=preds, references=labels, average="weighted")["recall"],
-        }
+    val_dataset = Dataset.from_pandas(
+        val_df,
+        preserve_index=False
+    )
 
-    args = TrainingArguments(
-        output_dir=OUT_DIR,
-        eval_strategy="epoch",
-        save_strategy="epoch",
+    def tokenize(batch):
+
+        return tokenizer(
+            batch[TEXT_COL],
+            truncation=True,
+            max_length=512,
+        )
+
+    train_dataset = train_dataset.map(
+        tokenize,
+        batched=True,
+        desc="Tokenizing training data",
+    )
+
+    val_dataset = val_dataset.map(
+        tokenize,
+        batched=True,
+        desc="Tokenizing validation data",
+    )
+
+    # Trainer expects the target column to be called "labels".
+    train_dataset = train_dataset.rename_column(
+        "label_id",
+        "labels"
+    )
+
+    val_dataset = val_dataset.rename_column(
+        "label_id",
+        "labels"
+    )
+
+    return tokenizer, train_dataset, val_dataset
+
+
+# ============================================================
+# METRICS
+# ============================================================
+
+def compute_metrics(eval_prediction):
+
+    predictions, labels = eval_prediction
+
+    # Some Transformers versions return
+    # predictions as a tuple.
+    if isinstance(predictions, tuple):
+        predictions = predictions[0]
+
+    predicted_labels = np.argmax(
+        predictions,
+        axis=-1
+    )
+
+    accuracy = accuracy_score(
+        labels,
+        predicted_labels
+    )
+
+    precision, recall, f1, _ = (
+        precision_recall_fscore_support(
+            labels,
+            predicted_labels,
+            average="weighted",
+            zero_division=0,
+        )
+    )
+
+    return {
+        "accuracy": accuracy,
+        "precision_weighted": precision,
+        "recall_weighted": recall,
+        "f1_weighted": f1,
+    }
+
+
+# ============================================================
+# MAIN TRAINING
+# ============================================================
+
+def main():
+
+    print("\n")
+    print("=" * 60)
+    print("LEGAL-BERT CLAUSE CLASSIFIER TRAINING")
+    print("=" * 60)
+
+    # --------------------------------------------------------
+    # Labels
+    # --------------------------------------------------------
+
+    label2id, id2label, num_labels = (
+        load_label_mapping()
+    )
+
+    if num_labels != 41:
+        raise ValueError(
+            f"Expected 41 CUAD classes, "
+            f"but found {num_labels}."
+        )
+
+    # --------------------------------------------------------
+    # Data
+    # --------------------------------------------------------
+
+    train_df, val_df = load_data()
+
+    print("\nTraining rows:", len(train_df))
+    print("Validation rows:", len(val_df))
+
+    # --------------------------------------------------------
+    # Check labels
+    # --------------------------------------------------------
+
+    invalid_train_labels = set(
+        train_df["label_id"]
+    ) - set(range(num_labels))
+
+    invalid_val_labels = set(
+        val_df["label_id"]
+    ) - set(range(num_labels))
+
+    if invalid_train_labels:
+        raise ValueError(
+            f"Invalid training labels: "
+            f"{invalid_train_labels}"
+        )
+
+    if invalid_val_labels:
+        raise ValueError(
+            f"Invalid validation labels: "
+            f"{invalid_val_labels}"
+        )
+
+    # --------------------------------------------------------
+    # Tokenizer + datasets
+    # --------------------------------------------------------
+
+    tokenizer, train_dataset, val_dataset = (
+        tokenize_datasets(
+            train_df,
+            val_df
+        )
+    )
+
+    # --------------------------------------------------------
+    # Model
+    # --------------------------------------------------------
+
+    print("\nLoading Legal-BERT model...")
+
+    model = (
+        AutoModelForSequenceClassification
+        .from_pretrained(
+            MODEL_NAME,
+
+            num_labels=num_labels,
+
+            id2label=id2label,
+
+            label2id=label2id,
+        )
+    )
+
+    print(
+        f"Model configured for "
+        f"{num_labels} clause categories."
+    )
+
+    # --------------------------------------------------------
+    # Data collator
+    # --------------------------------------------------------
+
+    data_collator = DataCollatorWithPadding(
+        tokenizer=tokenizer
+    )
+
+    # --------------------------------------------------------
+    # Training configuration
+    # --------------------------------------------------------
+
+    if QUICK_MODE:
+
+        epochs = QUICK_EPOCHS
+
+        output_dir = os.path.join(
+            OUT_DIR,
+            "quick_training"
+        )
+
+    else:
+
+        epochs = FULL_EPOCHS
+
+        output_dir = OUT_DIR
+
+    os.makedirs(
+        output_dir,
+        exist_ok=True
+    )
+
+    training_args = TrainingArguments(
+
+        output_dir=output_dir,
+
+        num_train_epochs=epochs,
+
         learning_rate=2e-5,
+
         per_device_train_batch_size=8,
+
         per_device_eval_batch_size=8,
-        num_train_epochs=QUICK_EPOCHS if QUICK_MODE else FULL_EPOCHS,
+
         weight_decay=0.01,
+
+        eval_strategy="epoch",
+
+        save_strategy="epoch",
+
+        logging_strategy="steps",
+
+        logging_steps=25,
+
         load_best_model_at_end=True,
+
         metric_for_best_model="f1_weighted",
-        logging_steps=50,
+
+        greater_is_better=True,
+
+        save_total_limit=2,
+
+        report_to="none",
+
+        # CPU machine
+        dataloader_pin_memory=False,
+
+        fp16=False,
+
+        remove_unused_columns=True,
     )
+
+    # --------------------------------------------------------
+    # Trainer
+    # --------------------------------------------------------
 
     trainer = Trainer(
+
         model=model,
-        args=args,
-        train_dataset=train_ds,
-        eval_dataset=val_ds,
-        data_collator=DataCollatorWithPadding(tokenizer=tokenizer),
+
+        args=training_args,
+
+        train_dataset=train_dataset,
+
+        eval_dataset=val_dataset,
+
+        processing_class=tokenizer,
+
+        data_collator=data_collator,
+
         compute_metrics=compute_metrics,
     )
 
-    trainer.train()
-    trainer.save_model(OUT_DIR)
-    tokenizer.save_pretrained(OUT_DIR)
-    print(f"\nModel + tokenizer saved -> {OUT_DIR}")
+    # --------------------------------------------------------
+    # Training
+    # --------------------------------------------------------
 
+    print("\n")
+    print("=" * 60)
+    print("STARTING TRAINING")
+    print("=" * 60)
+
+    trainer.train()
+
+    # --------------------------------------------------------
+    # Final evaluation
+    # --------------------------------------------------------
+
+    print("\n")
+    print("=" * 60)
+    print("VALIDATION RESULTS")
+    print("=" * 60)
+
+    metrics = trainer.evaluate()
+
+    for key, value in metrics.items():
+
+        if isinstance(value, float):
+
+            print(
+                f"{key}: {value:.4f}"
+            )
+
+        else:
+
+            print(
+                f"{key}: {value}"
+            )
+
+    # --------------------------------------------------------
+    # Save final model
+    # --------------------------------------------------------
+
+    print("\n")
+    print("=" * 60)
+    print("SAVING MODEL")
+    print("=" * 60)
+
+    if QUICK_MODE:
+
+        final_output_dir = os.path.join(
+            OUT_DIR,
+            "quick_model"
+        )
+
+    else:
+
+        final_output_dir = OUT_DIR
+
+    os.makedirs(
+        final_output_dir,
+        exist_ok=True
+    )
+
+    trainer.save_model(
+        final_output_dir
+    )
+
+    tokenizer.save_pretrained(
+        final_output_dir
+    )
+
+    # Save metrics
+    metrics_path = os.path.join(
+        final_output_dir,
+        "training_metrics.json"
+    )
+
+    with open(
+        metrics_path,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        json.dump(
+            {
+                key: (
+                    float(value)
+                    if isinstance(value, (np.floating, np.integer))
+                    else value
+                )
+                for key, value in metrics.items()
+            },
+            f,
+            indent=2,
+        )
+
+    # Save mapping alongside model
+    with open(
+        os.path.join(
+            final_output_dir,
+            "label_map.json"
+        ),
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        json.dump(
+            {
+                "label2id": label2id,
+                "id2label": {
+                    str(k): v
+                    for k, v in id2label.items()
+                },
+            },
+            f,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    print(
+        f"\nModel saved to:\n"
+        f"{final_output_dir}"
+    )
+
+    print("\nTraining complete.")
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
     main()

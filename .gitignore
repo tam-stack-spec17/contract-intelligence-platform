@@ -1,7 +1,27 @@
-﻿__pycache__/
-*.py[cod]
-.venv/
-venv/
-.env
+﻿# Local database / data
+data/
 *.db
-uploads/
+*.sqlite
+*.sqlite3
+
+# Local model artifacts
+models/
+deployment_model/
+*.zip
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# Environment / secrets
+.env
+
+# Temporary files
+*.log
+*.tmp
+main_backup.txt
+
+__pycache__/
+*.pyc
+
+.vercel
