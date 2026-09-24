@@ -24,3 +24,4 @@ main_backup.txt
 __pycache__/
 *.pyc
 
+.vercel

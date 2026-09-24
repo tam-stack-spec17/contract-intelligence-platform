@@ -1,4 +1,4 @@
-﻿const API_BASE_URL = "";
+const API_BASE_URL = "https://contract-intelligence-platform-two.vercel.app";
 
 const getToken = () => {
   return localStorage.getItem("contractintel_token");

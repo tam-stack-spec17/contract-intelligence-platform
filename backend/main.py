@@ -8,11 +8,11 @@ import hashlib
 import secrets
 import os
 import smtplib
+import requests
 from email.message import EmailMessage
 from datetime import datetime, timedelta
 
 import fitz
-import torch
 import pytesseract
 
 from PIL import Image
@@ -30,10 +30,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 
-from transformers import (
-    AutoTokenizer,
-    AutoModelForSequenceClassification,
-)
 
 from database import init_db, get_db
 from models import User, Contract, Analysis, EmailOTP
@@ -62,14 +58,21 @@ SMTP_USERNAME = os.getenv("SMTP_USERNAME", "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USERNAME)
 
-MODEL_PATH = (
-    BASE_DIR
-    / "models"
-    / "clause_classifier_final"
+HF_MODEL_ID = os.getenv(
+    "HF_MODEL_ID",
+    "praveen9052/contractiq-clause-classifier",
 )
 
-TESSERACT_PATH = (
-    r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+HF_TOKEN = os.getenv("HF_TOKEN", "")
+
+HF_API_URL = (
+    f"https://api-inference.huggingface.co/models/"
+    f"{HF_MODEL_ID}"
+)
+
+TESSERACT_PATH = os.getenv(
+    "TESSERACT_PATH",
+    r"C:\Program Files\Tesseract-OCR\tesseract.exe",
 )
 
 STORAGE_DIR = (
@@ -146,42 +149,14 @@ init_db()
 # MODEL
 # ============================================================
 
-tokenizer = None
-model = None
+# Production inference is performed by the Hugging Face hosted model.
+# This keeps the Vercel serverless function below its bundle-size limit.
+
+def check_model_configuration():
+    return bool(HF_MODEL_ID)
 
 
-def load_model():
-    global tokenizer, model
-
-    if not MODEL_PATH.exists():
-        raise FileNotFoundError(
-            f"Legal-BERT model not found at: {MODEL_PATH}"
-        )
-
-    print(
-        f"[MODEL] Loading Legal-BERT from: "
-        f"{MODEL_PATH}"
-    )
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        str(MODEL_PATH)
-    )
-
-    model = AutoModelForSequenceClassification.from_pretrained(
-        str(MODEL_PATH)
-    )
-
-    model.eval()
-
-    print("[MODEL] Loaded successfully.")
-
-    print(
-        f"[MODEL] Number of classes: "
-        f"{model.config.num_labels}"
-    )
-
-
-load_model()
+check_model_configuration()
 
 
 # ============================================================
@@ -1193,78 +1168,103 @@ def classify_clauses(
     relevant_segments = [
         segment
         for segment in segments
-        if is_relevant_clause(
-            segment
-        )
+        if is_relevant_clause(segment)
     ]
 
     if not relevant_segments:
+        relevant_segments = segments[:20]
 
-        relevant_segments = (
-            segments[:20]
-        )
+    if not HF_TOKEN:
+        print("[MODEL] HF_TOKEN is not configured.")
+        return []
 
     results = []
 
-    for start in range(
-        0,
-        len(relevant_segments),
-        CLASSIFICATION_BATCH_SIZE,
-    ):
+    headers = {
+        "Authorization": f"Bearer {HF_TOKEN}",
+        "Content-Type": "application/json",
+    }
 
-        batch = relevant_segments[
-            start:
-            start
-            + CLASSIFICATION_BATCH_SIZE
-        ]
+    for text in relevant_segments:
 
-        encoded = tokenizer(
-            batch,
-            padding=True,
-            truncation=True,
-            max_length=512,
-            return_tensors="pt",
-        )
+        payload = {
+            "inputs": text[:3000],
+            "options": {
+                "wait_for_model": True
+            }
+        }
 
-        with torch.no_grad():
-
-            outputs = model(
-                **encoded
+        try:
+            response = requests.post(
+                HF_API_URL,
+                headers=headers,
+                json=payload,
+                timeout=60,
             )
 
-        probabilities = (
-            torch.softmax(
-                outputs.logits,
-                dim=-1,
-            )
-        )
-
-        confidences, class_ids = (
-            torch.max(
-                probabilities,
-                dim=-1,
-            )
-        )
-
-        for (
-            text,
-            confidence,
-            class_id,
-        ) in zip(
-            batch,
-            confidences.tolist(),
-            class_ids.tolist(),
-        ):
-
-            if (
-                confidence
-                < MIN_CLAUSE_CONFIDENCE
-            ):
+            if response.status_code != 200:
+                print(
+                    f"[MODEL] Hugging Face returned "
+                    f"{response.status_code}: {response.text[:500]}"
+                )
                 continue
 
-            label = get_label_name(
-                class_id
+            prediction = response.json()
+
+            # Text-classification inference normally returns:
+            # [[{"label": "...", "score": 0.95}, ...]]
+            if (
+                isinstance(prediction, list)
+                and prediction
+                and isinstance(prediction[0], list)
+            ):
+                prediction = prediction[0]
+
+            if not isinstance(prediction, list) or not prediction:
+                continue
+
+            best = max(
+                prediction,
+                key=lambda item: float(
+                    item.get("score", 0)
+                ),
             )
+
+            confidence = float(
+                best.get("score", 0)
+            )
+
+            if confidence < MIN_CLAUSE_CONFIDENCE:
+                continue
+
+            raw_label = str(
+                best.get("label", "")
+            )
+
+            # Prefer the trained model's explicit label when it
+            # corresponds to our known CUAD label list.
+            label = raw_label
+
+            if raw_label.startswith("LABEL_"):
+                try:
+                    class_id = int(
+                        raw_label.split("_")[-1]
+                    )
+                    label = get_label_name(class_id)
+                except (ValueError, IndexError):
+                    class_id = -1
+            else:
+                class_id = -1
+
+                normalized = raw_label.lower().strip()
+
+                for index, known_label in enumerate(
+                    DEFAULT_LABEL_NAMES
+                ):
+                    if known_label.lower() == normalized:
+                        class_id = index
+                        label = known_label
+                        break
 
             results.append(
                 {
@@ -1273,13 +1273,19 @@ def classify_clauses(
                         confidence,
                         4,
                     ),
-                    "class_id": int(
-                        class_id
-                    ),
-                    "text": text[
-                        :3000
-                    ],
+                    "class_id": int(class_id),
+                    "text": text[:3000],
                 }
+            )
+
+        except requests.RequestException as exc:
+            print(
+                f"[MODEL] Hugging Face request failed: {exc}"
+            )
+
+        except Exception as exc:
+            print(
+                f"[MODEL] Classification error: {exc}"
             )
 
     return results
@@ -1475,11 +1481,7 @@ async def perform_contract_analysis(
                 frontend_clauses
             ),
             "ocr_used": ocr_used,
-            "model_classes": (
-                model.config.num_labels
-                if model is not None
-                else 0
-            ),
+            "model_classes": len(DEFAULT_LABEL_NAMES),
             "contract_detection": (
                 contract_detection
             ),
@@ -2830,14 +2832,8 @@ def health():
         "service": (
             "contract-intelligence-api"
         ),
-        "model_loaded": (
-            model is not None
-        ),
-        "model_classes": (
-            model.config.num_labels
-            if model is not None
-            else 0
-        ),
+        "model_loaded": bool(HF_TOKEN),
+        "model_classes": len(DEFAULT_LABEL_NAMES),
         "ocr_available": Path(
             TESSERACT_PATH
         ).exists(),
@@ -2845,5 +2841,5 @@ def health():
         "version": "3.1.0",
         "authentication": True,
         "password_reset": True,
-        "otp_mode": "development",
+        "otp_mode": "smtp",
     }
